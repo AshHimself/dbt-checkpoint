@@ -1,72 +1,91 @@
 import argparse
 import os
-import re
 import time
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence, Set, Tuple
 
 from dbt_checkpoint.tracking import dbtCheckpointTracking
 from dbt_checkpoint.utils import (
     JsonOpenError,
     add_catalog_args,
     add_default_args,
-    get_filenames,
     get_json,
+    get_missing_file_paths,
+    get_model_sqls,
     get_models,
     red,
     yellow,
 )
 
 
-def check_column_name_contract(
-    paths: Sequence[str], pattern: str, dtype: str, catalog: Dict[str, Any]
-) -> Dict[str, Any]:
+def compare_columns(
+    catalog_columns: Dict[str, Any], model_columns: Dict[str, Any]
+) -> Tuple[Set[str], Set[str]]:
+    catalog_cols = {col.lower() for col in catalog_columns.keys()}
+    model_cols = {col.lower() for col in model_columns.keys()}
+    model_only = model_cols.difference(catalog_cols)
+    catalog_only = catalog_cols.difference(model_cols)
+    return model_only, catalog_only
+
+
+def check_model_columns(
+    paths: Sequence[str], manifest: Dict[str, Any], catalog: Dict[str, Any]
+) -> int:
+    paths = get_missing_file_paths(paths, manifest)
+
     status_code = 0
-    sqls = get_filenames(paths, [".sql"])
+    sqls = get_model_sqls(paths, manifest)
     filenames = set(sqls.keys())
-    models = get_models(catalog, filenames)
+
+    # get manifest nodes that pre-commit found as changed
+    models = get_models(manifest, filenames)
+
+    catalog_nodes = catalog.get("nodes", {})
 
     for model in models:
-        for col in model.node.get("columns", []).values():
-            col_name = col.get("name")
-            col_type = col.get("type")
-
-            # Check all files of type dtype follow naming pattern
-            if dtype == col_type:
-                if re.match(pattern, col_name) is None:
-                    status_code = 1
-                    print(
-                        f"{red(col_name)}: column is of type {yellow(dtype)} and "
-                        f"does not match regex pattern {yellow(pattern)}."
-                    )
-
-            # Check all files with naming pattern are of type dtype
-            elif re.match(pattern, col_name):
+        catalog_node = catalog_nodes.get(model.model_id, {})
+        if catalog_node:
+            model_only, catalog_only = compare_columns(
+                catalog_columns=catalog_node.get("columns", {}),
+                model_columns=model.node.get("columns", {}),
+            )
+            schema_path = model.node.get("patch_path", "schema")  # pragma: no mutate
+            if not schema_path:
+                schema_path = "any .yml file"  # pragma: no cover
+            if model_only:
                 status_code = 1
+                print_cols = ["- name: %s" % yellow(col) for col in model_only if col]
                 print(
-                    f"{red(col_name)}: name matches regex pattern {yellow(pattern)} "
-                    f"and is of type {yellow(col_type)} instead of {yellow(dtype)}."
+                    "Columns in {schema_path}, but not in Database ({file}):\n"
+                    "{columns}".format(
+                        file=red(sqls.get(model.filename)),
+                        columns="\n".join(print_cols),  # pragma: no mutate
+                        schema_path=yellow(schema_path),
+                    )
                 )
-
-    return {"status_code": status_code}
+            if catalog_only:
+                status_code = 1
+                print_cols = ["- name: %s" % red(col) for col in catalog_only if col]
+                print(
+                    "Columns in Database ({file}), but not in {schema_path}:\n"
+                    "{columns}".format(
+                        file=red(sqls.get(model.filename)),
+                        columns="\n".join(print_cols),  # pragma: no mutate
+                        schema_path=yellow(schema_path),
+                    )
+                )
+        else:
+            status_code = 1
+            print(
+                f"Unable to find model `{red(model.model_id)}` in catalog file. "
+                f"Make sure you run `dbt docs generate` before executing this hook."
+            )
+    return status_code
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser()
     add_default_args(parser)
     add_catalog_args(parser)
-
-    parser.add_argument(
-        "--pattern",
-        type=str,
-        required=True,
-        help="Regex pattern to match column names.",
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        required=True,
-        help="Expected data type for the matching columns.",
-    )
 
     args = parser.parse_args(argv)
 
@@ -83,15 +102,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     start_time = time.time()
-    hook_properties = check_column_name_contract(
-        paths=args.filenames,
-        pattern=args.pattern,
-        dtype=args.dtype,
-        catalog=catalog,
+    status_code = check_model_columns(
+        paths=args.filenames, manifest=manifest, catalog=catalog
     )
-
     end_time = time.time()
-
     script_args = vars(args)
 
     tracker = dbtCheckpointTracking(script_args=script_args)
@@ -100,14 +114,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         manifest=manifest,
         event_properties={
             "hook_name": os.path.basename(__file__),
-            "description": "Check column name abides to contract.",
-            "status": hook_properties.get("status_code"),
+            "description": "Check model has all columns",
+            "status": status_code,
             "execution_time": end_time - start_time,
             "is_pytest": script_args.get("is_test"),
         },
     )
 
-    return hook_properties.get("status_code")
+    return status_code
 
 
 if __name__ == "__main__":
